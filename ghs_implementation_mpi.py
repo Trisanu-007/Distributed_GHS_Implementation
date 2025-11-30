@@ -1,4 +1,4 @@
-"""
+﻿"""
 MPI-based GHS Algorithm Implementation
 Each MPI process represents a node in the graph
 """
@@ -94,6 +94,9 @@ class MPINode:
             return
 
         message = {"type": msg_type.value, "sender": self.rank, "data": data}
+        print(
+            f"[Node {self.rank}] >> Sending {msg_type.name} to Node {target} | Data: {data}"
+        )
         self.comm.send(message, dest=target, tag=msg_type.value)
 
     def receive_message(self, timeout=0.01):
@@ -102,6 +105,9 @@ class MPINode:
 
         if self.comm.iprobe(source=MPI.ANY_SOURCE, tag=MPI.ANY_TAG, status=status):
             message = self.comm.recv(source=status.Get_source(), tag=status.Get_tag())
+            msg_type = MessageType(message["type"])
+            sender = message["sender"]
+            print(f"[Node {self.rank}] << Received {msg_type.name} from Node {sender}")
             return message
         return None
 
@@ -110,6 +116,12 @@ class MPINode:
         if self.state == NodeState.SLEEPING and self.neighbors:
             # Find minimum weight edge
             min_neighbor = min(self.neighbors.items(), key=lambda x: x[1])[0]
+            min_weight = self.neighbors[min_neighbor]
+
+            print(f"\n[Node {self.rank}] *** WAKEUP | State: SLEEPING -> FOUND")
+            print(
+                f"[Node {self.rank}] +++ MST EDGE ADDED: ({self.rank}, {min_neighbor}) weight={min_weight}"
+            )
 
             # Mark as branch
             self.edge_states[min_neighbor] = EdgeState.BRANCH
@@ -117,12 +129,14 @@ class MPINode:
             self.state = NodeState.FOUND
             self.find_count = 0
 
+            print(
+                f"[Node {self.rank}] State: level=0, fragment={self.fragment_id}, state=FOUND"
+            )
+
             # Send CONNECT
             self.send_message(
                 min_neighbor, MessageType.CONNECT, level=0, fragment_id=self.fragment_id
             )
-
-            print(f"[Node {self.rank}] Woke up, connecting to node {min_neighbor}")
 
     def process_message(self, msg):
         """Process incoming message"""
@@ -152,10 +166,25 @@ class MPINode:
         level = data["level"]
         sender_fragment_id = data.get("fragment_id", sender)  # Fallback to sender ID
 
+        print(f"\n[Node {self.rank}] === HANDLE CONNECT from Node {sender}")
+        print(
+            f"[Node {self.rank}] Sender: level={level}, fragment={sender_fragment_id}"
+        )
+        print(
+            f"[Node {self.rank}] My state: level={self.level}, fragment={self.fragment_id}, state={self.state.name}"
+        )
+
         if self.state == NodeState.SLEEPING:
+            print(f"[Node {self.rank}] I was sleeping, waking up first...")
             self.wakeup()
 
         if level < self.level:
+            print(
+                f"[Node {self.rank}] Sender level < my level -> Absorbing into my fragment"
+            )
+            print(
+                f"[Node {self.rank}] +++ MST EDGE ADDED: ({self.rank}, {sender}) weight={self.neighbors[sender]}"
+            )
             self.edge_states[sender] = EdgeState.BRANCH
             self.send_message(
                 sender,
@@ -170,8 +199,12 @@ class MPINode:
             # Wait before processing to avoid race conditions
             time.sleep(0.001)
 
+            print(f"[Node {self.rank}] Same level merge detected")
             # Only mark as BRANCH if not already marked
             if self.edge_states.get(sender) == EdgeState.BASIC:
+                print(
+                    f"[Node {self.rank}] +++ MST EDGE ADDED: ({self.rank}, {sender}) weight={self.neighbors[sender]}"
+                )
                 self.edge_states[sender] = EdgeState.BRANCH
 
             new_fragment_id = max(self.fragment_id, sender_fragment_id)
@@ -183,7 +216,13 @@ class MPINode:
             sender_priority = (sender_fragment_id, sender)
             should_initiate = my_priority > sender_priority
 
+            print(
+                f"[Node {self.rank}] Priority check: my={my_priority} vs sender={sender_priority}"
+            )
             if should_initiate:
+                print(
+                    f"[Node {self.rank}] I have priority -> Initiating merge to level {new_level}"
+                )
                 # We initiate the merge - update our own state first
                 self.level = new_level
                 self.fragment_id = new_fragment_id
@@ -234,6 +273,14 @@ class MPINode:
         old_level = self.level
         old_fragment = self.fragment_id
 
+        print(f"\n[Node {self.rank}] ~~~ HANDLE INITIATE from Node {sender}")
+        print(
+            f"[Node {self.rank}] State change: level {old_level}->{level}, fragment {old_fragment}->{fragment_id}"
+        )
+        print(
+            f"[Node {self.rank}] New state: {NodeState(state_value).name}, in_branch={sender}"
+        )
+
         self.level = level
         self.fragment_id = fragment_id
         self.state = NodeState(state_value)
@@ -249,8 +296,15 @@ class MPINode:
             if n != sender and self.edge_states[n] == EdgeState.BRANCH
         ]
 
+        print(
+            f"[Node {self.rank}] Branch neighbors (excluding sender): {branch_neighbors}"
+        )
+
         # Propagate to branches
         for neighbor in branch_neighbors:
+            print(
+                f"[Node {self.rank}] Propagating INITIATE to branch neighbor {neighbor}"
+            )
             self.send_message(
                 neighbor,
                 MessageType.INITIATE,
@@ -261,13 +315,17 @@ class MPINode:
             if self.state == NodeState.FIND:
                 self.find_count += 1
 
+        print(f"[Node {self.rank}] find_count={self.find_count}")
+
         # Small delay to ensure fragment membership propagates before testing
         if self.state == NodeState.FIND:
+            print(f"[Node {self.rank}] State is FIND -> Starting test phase")
             time.sleep(0.002)  # 2ms delay for synchronization
             self.test()
         elif self.state == NodeState.FOUND:
             # If propagating FOUND state, report immediately if no children
             if self.find_count == 0:
+                print(f"[Node {self.rank}] State is FOUND, no children -> Reporting")
                 self.report()
 
     def test(self):
@@ -278,9 +336,15 @@ class MPINode:
             if self.edge_states[n] == EdgeState.BASIC
         ]
 
+        print(f"\n[Node {self.rank}] ??? TEST phase")
+        print(f"[Node {self.rank}] Available BASIC edges: {basic_edges}")
+
         if basic_edges:
             # Sort by weight, then by node ID for deterministic tie-breaking
             self.test_edge = min(basic_edges, key=lambda x: (x[1], x[0]))[0]
+            print(
+                f"[Node {self.rank}] Testing edge to Node {self.test_edge} (weight={self.neighbors[self.test_edge]})"
+            )
             self.send_message(
                 self.test_edge,
                 MessageType.TEST,
@@ -288,6 +352,7 @@ class MPINode:
                 fragment_id=self.fragment_id,
             )
         else:
+            print(f"[Node {self.rank}] No BASIC edges left -> Reporting to parent")
             self.test_edge = None
             self.report()
 
@@ -296,7 +361,14 @@ class MPINode:
         level = data["level"]
         fragment_id = data["fragment_id"]
 
+        print(f"\n[Node {self.rank}] ??? HANDLE TEST from Node {sender}")
+        print(f"[Node {self.rank}] Sender: level={level}, fragment={fragment_id}")
+        print(
+            f"[Node {self.rank}] My state: level={self.level}, fragment={self.fragment_id}"
+        )
+
         if self.state == NodeState.SLEEPING:
+            print(f"[Node {self.rank}] I was sleeping, waking up first...")
             self.wakeup()
 
         if level > self.level:
@@ -304,43 +376,82 @@ class MPINode:
             msg_key = (MessageType.TEST.value, sender, level)
             defer_count = self.defer_count.get(msg_key, 0)
             if defer_count < 5:  # Allow more deferrals for larger graphs
+                print(
+                    f"[Node {self.rank}] Sender level > my level -> Deferring TEST (count={defer_count + 1})"
+                )
                 self.deferred_messages.append(
                     {"type": MessageType.TEST.value, "sender": sender, "data": data}
                 )
                 self.defer_count[msg_key] = defer_count + 1
             else:
                 # Too many deferrals - accept to prevent deadlock
+                print(
+                    f"[Node {self.rank}] Too many deferrals -> Accepting to prevent deadlock"
+                )
                 self.send_message(sender, MessageType.ACCEPT)
             return
         elif fragment_id == self.fragment_id:
             # Same fragment - reject the edge
+            print(
+                f"[Node {self.rank}] Same fragment detected -> REJECTING edge ({self.rank}, {sender})"
+            )
             if self.edge_states[sender] == EdgeState.BASIC:
                 self.edge_states[sender] = EdgeState.REJECTED
             if sender != self.test_edge:
                 self.send_message(sender, MessageType.REJECT)
             else:
                 # We were testing this edge, need to test another
+                print(
+                    f"[Node {self.rank}] This was my test_edge -> Testing another edge"
+                )
                 self.test()
         else:
             # Different fragment - accept as potential MST edge
+            print(
+                f"[Node {self.rank}] Different fragment -> ACCEPTING edge as potential MST edge"
+            )
             self.send_message(sender, MessageType.ACCEPT)
 
     def handle_accept(self, sender, data):
         """Handle ACCEPT message"""
+        print(f"\n[Node {self.rank}] [OK] HANDLE ACCEPT from Node {sender}")
+        print(
+            f"[Node {self.rank}] Edge ({self.rank}, {sender}) weight={self.neighbors[sender]}"
+        )
+
         self.test_edge = None
         if self.neighbors[sender] < self.best_weight:
+            print(
+                f"[Node {self.rank}] New best edge: {sender} (weight {self.neighbors[sender]} < {self.best_weight})"
+            )
             self.best_edge = sender
             self.best_weight = self.neighbors[sender]
         elif self.neighbors[sender] == self.best_weight and self.best_edge is not None:
             # Tie-breaking: prefer lower node ID for determinism
             if sender < self.best_edge:
+                print(
+                    f"[Node {self.rank}] Tie-breaking: choosing {sender} over {self.best_edge}"
+                )
                 self.best_edge = sender
+        else:
+            print(
+                f"[Node {self.rank}] Not better than current best (weight={self.best_weight})"
+            )
+
+        print(
+            f"[Node {self.rank}] Current best: edge to {self.best_edge}, weight={self.best_weight}"
+        )
         self.report()
 
     def handle_reject(self, sender, data):
         """Handle REJECT message"""
+        print(f"\n[Node {self.rank}] [X] HANDLE REJECT from Node {sender}")
+        print(f"[Node {self.rank}] Marking edge ({self.rank}, {sender}) as REJECTED")
+
         if self.edge_states[sender] == EdgeState.BASIC:
             self.edge_states[sender] = EdgeState.REJECTED
+
+        print(f"[Node {self.rank}] Testing another edge...")
         self.test()
 
     def report(self):
@@ -348,51 +459,102 @@ class MPINode:
         if self.find_count < 0:
             self.find_count = 0
 
+        print(
+            f"\n[Node {self.rank}] ||| REPORT check: find_count={self.find_count}, test_edge={self.test_edge}"
+        )
+
         if self.find_count == 0 and self.test_edge is None:
+            old_state = self.state
             self.state = NodeState.FOUND
+            print(f"[Node {self.rank}] State: {old_state.name} -> FOUND")
+            print(
+                f"[Node {self.rank}] Best edge: {self.best_edge}, weight={self.best_weight}"
+            )
+
             if self.in_branch is not None:
+                print(f"[Node {self.rank}] Reporting to parent (Node {self.in_branch})")
                 self.send_message(
                     self.in_branch, MessageType.REPORT, weight=self.best_weight
                 )
             else:
                 # Root node - initiate merge if outgoing edge exists
+                print(f"[Node {self.rank}] I am ROOT of fragment {self.fragment_id}")
                 if self.best_weight < float("inf"):
+                    print(
+                        f"[Node {self.rank}] ROOT: Found outgoing edge, initiating CHANGEROOT"
+                    )
                     self.changeroot()
                 else:
                     # No outgoing edges found - algorithm complete for this fragment
+                    print(
+                        f"[Node {self.rank}] ROOT: No outgoing edges -> Fragment complete"
+                    )
                     self.terminated = True
+        else:
+            print(
+                f"[Node {self.rank}] Not ready to report yet (waiting for children or test result)"
+            )
 
     def handle_report(self, sender, data):
         """Handle REPORT message"""
         weight = data["weight"]
 
+        print(f"\n[Node {self.rank}] ||| HANDLE REPORT from Node {sender}")
+        print(
+            f"[Node {self.rank}] Reported weight: {weight}, my best: {self.best_weight}"
+        )
+
         if sender != self.in_branch:
             # Report from child
+            print(f"[Node {self.rank}] Report from child (not in_branch)")
             if self.find_count > 0:
                 self.find_count -= 1
+                print(f"[Node {self.rank}] Decremented find_count to {self.find_count}")
+
             if weight < self.best_weight:
+                print(
+                    f"[Node {self.rank}] Child's edge is better: {weight} < {self.best_weight}"
+                )
                 self.best_weight = weight
                 self.best_edge = sender
             elif weight == self.best_weight and weight < float("inf"):
                 # Tie-breaking: prefer lower node ID
                 if self.best_edge is None or sender < self.best_edge:
+                    print(f"[Node {self.rank}] Tie-breaking: choosing {sender}")
                     self.best_edge = sender
+
+            print(
+                f"[Node {self.rank}] Current best: edge to {self.best_edge}, weight={self.best_weight}"
+            )
             self.report()
         elif self.state == NodeState.FOUND:
             # Already in FOUND, check if we should change root
+            print(f"[Node {self.rank}] Report from in_branch while in FOUND state")
             if weight > self.best_weight:
+                print(
+                    f"[Node {self.rank}] Parent's weight > mine -> Initiating CHANGEROOT"
+                )
                 self.changeroot()
             elif weight == self.best_weight and weight < float("inf"):
                 # Both have same weight, use node ID to break tie
                 if self.rank < sender:
+                    print(
+                        f"[Node {self.rank}] Tie + lower rank -> Initiating CHANGEROOT"
+                    )
                     self.changeroot()
 
     def changeroot(self):
         """Change root of fragment"""
+        print(f"\n[Node {self.rank}] <-> CHANGEROOT initiated")
+
         if self.best_edge is None or self.best_edge not in self.edge_states:
+            print(f"[Node {self.rank}] No valid best_edge, returning")
             return
 
         edge_state = self.edge_states[self.best_edge]
+        print(
+            f"[Node {self.rank}] Best edge: {self.best_edge} (weight={self.best_weight}), state={edge_state.name}"
+        )
 
         # Prevent infinite loops - don't call changeroot on already processed edges
         if (
@@ -401,8 +563,12 @@ class MPINode:
         ):
             if hasattr(self, "_changeroot_count"):
                 self._changeroot_count += 1
+                print(
+                    f"[Node {self.rank}] Repeated changeroot on same edge (count={self._changeroot_count})"
+                )
                 if self._changeroot_count > 5:
                     # Tried too many times, likely done
+                    print(f"[Node {self.rank}] Too many retries -> Terminating")
                     self.terminated = True
                     return
             else:
@@ -412,8 +578,15 @@ class MPINode:
             self._changeroot_count = 1
 
         if edge_state == EdgeState.BRANCH:
+            print(
+                f"[Node {self.rank}] Best edge is BRANCH -> Forwarding CHANGEROOT to {self.best_edge}"
+            )
             self.send_message(self.best_edge, MessageType.CHANGEROOT)
         elif edge_state == EdgeState.BASIC:
+            print(f"[Node {self.rank}] Best edge is BASIC -> Converting to BRANCH")
+            print(
+                f"[Node {self.rank}] +++ MST EDGE ADDED: ({self.rank}, {self.best_edge}) weight={self.best_weight}"
+            )
             self.edge_states[self.best_edge] = EdgeState.BRANCH
             self.send_message(
                 self.best_edge,
@@ -426,26 +599,39 @@ class MPINode:
             self.best_edge = None
             self.best_weight = float("inf")
             self.state = NodeState.FIND
+            print(f"[Node {self.rank}] State changed to FIND, waiting for new INITIATE")
         elif edge_state == EdgeState.REJECTED:
             # Edge was rejected, reset and continue
+            print(
+                f"[Node {self.rank}] Best edge was REJECTED -> Resetting and testing again"
+            )
             self.best_edge = None
             self.best_weight = float("inf")
             self.test()
 
     def handle_changeroot(self, sender, data):
         """Handle CHANGEROOT message"""
+        print(f"\n[Node {self.rank}] <-> HANDLE CHANGEROOT from Node {sender}")
+        print(f"[Node {self.rank}] My best_edge: {self.best_edge}")
+
         # Only propagate if we have a valid best_edge that's not already processed
         if (
             self.best_edge is not None
             and self.edge_states.get(self.best_edge) == EdgeState.BASIC
         ):
+            print(f"[Node {self.rank}] Best edge is BASIC -> Calling changeroot")
             self.changeroot()
         elif (
             self.best_edge is not None
             and self.edge_states.get(self.best_edge) == EdgeState.BRANCH
         ):
             # Already processed, forward the changeroot
+            print(
+                f"[Node {self.rank}] Best edge is BRANCH -> Forwarding CHANGEROOT to {self.best_edge}"
+            )
             self.send_message(self.best_edge, MessageType.CHANGEROOT)
+        else:
+            print(f"[Node {self.rank}] No valid best_edge to propagate CHANGEROOT")
 
     def run(self, max_iterations=5000):
         """Main execution loop"""
