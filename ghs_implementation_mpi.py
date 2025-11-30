@@ -63,6 +63,9 @@ class MPINode:
         self.deferred_messages = []
         self.defer_count = {}
 
+        # Track pending CONNECT messages we've sent to prevent duplicate edges
+        self.pending_connects = set()
+
         # Termination - scale with graph size
         self.terminated = False
         self.idle_iterations = 0
@@ -200,12 +203,31 @@ class MPINode:
             time.sleep(0.001)
 
             print(f"[Node {self.rank}] Same level merge detected")
-            # Only mark as BRANCH if not already marked
-            if self.edge_states.get(sender) == EdgeState.BASIC:
+
+            # Only proceed if fragments are actually different
+            if self.fragment_id == sender_fragment_id:
+                print(
+                    f"[Node {self.rank}] WARNING: Same fragment at same level - possible race condition"
+                )
+                print(
+                    f"[Node {self.rank}] This should not happen in GHS. Ignoring CONNECT."
+                )
+                return
+
+            # Check if this is a symmetric CONNECT (both sent to each other)
+            if sender in self.pending_connects:
+                print(
+                    f"[Node {self.rank}] Symmetric CONNECT detected with {sender} - edge already marked as BRANCH"
+                )
+                self.pending_connects.discard(sender)  # Clear the pending flag
+                # Edge already marked as BRANCH by us, don't mark again
+            elif self.edge_states.get(sender) == EdgeState.BASIC:
                 print(
                     f"[Node {self.rank}] +++ MST EDGE ADDED: ({self.rank}, {sender}) weight={self.neighbors[sender]}"
                 )
                 self.edge_states[sender] = EdgeState.BRANCH
+            elif self.edge_states.get(sender) == EdgeState.BRANCH:
+                print(f"[Node {self.rank}] Edge already BRANCH (from our CONNECT)")
 
             new_fragment_id = max(self.fragment_id, sender_fragment_id)
             new_level = self.level + 1
@@ -390,7 +412,21 @@ class MPINode:
                 )
                 self.send_message(sender, MessageType.ACCEPT)
             return
-        elif fragment_id == self.fragment_id:
+        elif level == self.level and self.state == NodeState.FIND:
+            # Defer if we're still in FIND state at the same level - fragment ID might not be stable yet
+            msg_key = (MessageType.TEST.value, sender, level, fragment_id)
+            defer_count = self.defer_count.get(msg_key, 0)
+            if defer_count < 3:
+                print(
+                    f"[Node {self.rank}] Still in FIND state -> Deferring TEST briefly (count={defer_count + 1})"
+                )
+                self.deferred_messages.append(
+                    {"type": MessageType.TEST.value, "sender": sender, "data": data}
+                )
+                self.defer_count[msg_key] = defer_count + 1
+                return
+
+        if fragment_id == self.fragment_id:
             # Same fragment - reject the edge
             print(
                 f"[Node {self.rank}] Same fragment detected -> REJECTING edge ({self.rank}, {sender})"
@@ -588,6 +624,7 @@ class MPINode:
                 f"[Node {self.rank}] +++ MST EDGE ADDED: ({self.rank}, {self.best_edge}) weight={self.best_weight}"
             )
             self.edge_states[self.best_edge] = EdgeState.BRANCH
+            self.pending_connects.add(self.best_edge)  # Track this CONNECT
             self.send_message(
                 self.best_edge,
                 MessageType.CONNECT,
@@ -643,6 +680,7 @@ class MPINode:
 
         iteration = 0
         messages_processed = 0
+        last_progress_report = 0
 
         while iteration < max_iterations and not self.terminated:
             # Try to receive and process messages
@@ -679,20 +717,35 @@ class MPINode:
                     stuck_threshold  # Reset to threshold to continue trying
                 )
 
-            # Stop if completely idle (likely done) - scale with graph size
-            max_idle_threshold = max(1000, self.size * 100)
+            # Stop if completely idle (likely done) - more aggressive termination
+            max_idle_threshold = max(500, self.size * 50)
             if self.idle_iterations > max_idle_threshold:
+                print(
+                    f"[Node {self.rank}] Terminating due to idle threshold", flush=True
+                )
                 break
 
-            # Don't use per-node branch count for early termination
-            # as it can cause premature stopping in disconnected fragments
+            # Progress reporting every 1000 iterations
+            if iteration - last_progress_report >= 1000:
+                print(
+                    f"[Node {self.rank}] Iteration {iteration}, idle={self.idle_iterations}, state={self.state.name}",
+                    flush=True,
+                )
+                last_progress_report = iteration
 
             iteration += 1
 
-        if self.rank == 0:
-            print(
-                f"[Node {self.rank}] Finished after {iteration} iterations, processed {messages_processed} messages"
-            )
+            # Hard timeout based on iteration count
+            if iteration >= max_iterations * 0.9:
+                print(
+                    f"[Node {self.rank}] WARNING: Approaching max iterations",
+                    flush=True,
+                )
+
+        print(
+            f"[Node {self.rank}] Finished after {iteration} iterations, processed {messages_processed} messages",
+            flush=True,
+        )
 
     def get_mst_edges(self):
         """Get MST edges from this node"""
@@ -866,8 +919,10 @@ def main():
 
     start_time = time.time()
 
-    # Run GHS algorithm (scale with graph size)
-    max_iters = max(5000, size * 1000)
+    # Run GHS algorithm (scale with graph size but cap for debugging)
+    max_iters = min(3000, max(2000, size * 300))
+    if rank == 0:
+        print(f"Running with max_iterations={max_iters}", flush=True)
     node.run(max_iterations=max_iters)
 
     # Barrier to ensure all nodes finish
